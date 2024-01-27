@@ -172,7 +172,7 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	while (true)
 	{
-		auto PID = isProcessRunning(_T("cmd.exe"));
+		auto PID = isProcessRunning(_T("CompatTelRunner.exe"));
 		if (PID != 0)
 		{
 			printf("\nFound PID %u, terminating...\n", PID);
