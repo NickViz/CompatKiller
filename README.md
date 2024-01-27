@@ -1,0 +1,2 @@
+# CompatKiller
+Kills CompatTelRunner.exe
