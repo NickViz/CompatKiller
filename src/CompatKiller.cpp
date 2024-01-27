@@ -26,22 +26,28 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <psapi.h>
+#include <processthreadsapi.h>
 #include <stdio.h>
 #include <tchar.h>
 #include <vector>
 #include <string>
-#pragma comment(lib, "psapi.lib") 
 
-// This function returns vector DWORD filled in with the current PIDs
+#if defined(_UNICODE) || defined(UNICODE)
+typedef std::wstring tstring;
+#else
+typedef std::string tstring;
+#endif
+
 static std::vector<DWORD> getProcIDs()
 {
-	std::vector<DWORD> out(200, 0); // Init size;
+	std::vector<DWORD> out(512, 0); // Init size
 	try
-	{	// Get the list of process identifiers.
-		DWORD cbNeeded = -1;
-		while (::EnumProcesses(out.data(), out.size() * sizeof DWORD, &cbNeeded) &&
-							   cbNeeded >= out.size() * sizeof DWORD)
-			out.resize(cbNeeded / sizeof DWORD + 1);
+	{
+		DWORD cbReturned = 0;
+		while (::EnumProcesses(out.data(), out.size() * sizeof DWORD, &cbReturned) &&
+				cbReturned >= out.size() * sizeof DWORD)
+			out.resize(out.size() * 2);
+		out.resize(cbReturned / sizeof DWORD);
 	}
 	catch (...) // memory
 	{
@@ -50,17 +56,15 @@ static std::vector<DWORD> getProcIDs()
 	return out;
 }
 
-static std::string getProcessName(DWORD PID)
+static tstring getProcessName(DWORD PID)
 {
-	TCHAR szName[2 * MAX_PATH];
+	TCHAR szName[MAX_PATH];
 	szName[0] = 0;
 
-	// Get a handle to the process.
 	HANDLE hProcess = ::OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, PID);
 	if (hProcess == NULL)
 		return szName;
 
-	// Get the process name.
 	DWORD dwLen = ::GetModuleBaseName(hProcess, 0, szName, std::size(szName));
 	if (dwLen == 0 && GetLastError() == ERROR_PARTIAL_COPY)
 	{	// Trying to open 64-bit process from 32-bit one
@@ -77,43 +81,107 @@ static std::string getProcessName(DWORD PID)
 	return szName;
 }
 
-static bool isProcessRunning(LPCTSTR szName)
+static DWORD isProcessRunning(LPCTSTR szName)
 {
-	auto processes = getProcIDs();
-	if (processes.empty())
-		return false;
-
-	// Scan through the all and check for names
-	for (auto ID : processes)
+	for (auto PID : getProcIDs())
 	{
-		auto name = getProcessName(ID);
+		auto name = getProcessName(PID);
 		if (_tcsicmp(name.c_str(), szName) == 0)
-			return true;
+			return PID;
 	}
-	return false;
+	return 0;
 }
 
-
-static int help()
+class CPrivilege
 {
-	_tprintf(_T("This application is intended to kill annoying CompatTelRunner process\n\n"));
-	return 0;
+public:
+	explicit CPrivilege(LPCTSTR privilege) : hToken_(NULL), privilege_(privilege)
+	{
+		auto ret = ::OpenProcessToken(::GetCurrentProcess(),
+									  TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken_);
+		if (ret)
+			Set(privilege, true);
+		else
+			hToken_ = NULL;
+	}
+
+	~CPrivilege()
+	{
+		Set(privilege_.c_str(), false);
+		if (hToken_)
+			::CloseHandle(hToken_);
+	}
+
+	bool Set(LPCTSTR privilege, bool enable)
+	{
+		if (hToken_ == NULL || privilege == nullptr)
+			return false;
+
+		LUID luid;
+		if (!::LookupPrivilegeValue(NULL, privilege, &luid))
+			return false;
+
+		// first pass. get current privilege setting
+		TOKEN_PRIVILEGES tp; // Can use default struct as only one LUID is used
+		tp.PrivilegeCount = 1;
+		tp.Privileges[0].Luid = luid;
+		tp.Privileges[0].Attributes = 0;
+		TOKEN_PRIVILEGES tpPrevious;
+		DWORD cbPrevious = sizeof TOKEN_PRIVILEGES;
+		::AdjustTokenPrivileges(hToken_, false, &tp, sizeof TOKEN_PRIVILEGES,
+								&tpPrevious, &cbPrevious);
+		if (::GetLastError() != ERROR_SUCCESS)
+			return false;
+
+		// second pass. set privilege based on the previous setting
+		tpPrevious.PrivilegeCount = 1;
+		tpPrevious.Privileges[0].Luid = luid;
+
+		if (enable)
+			tpPrevious.Privileges[0].Attributes |= (SE_PRIVILEGE_ENABLED);
+		else
+			tpPrevious.Privileges[0].Attributes ^= (SE_PRIVILEGE_ENABLED &
+												tpPrevious.Privileges[0].Attributes);
+
+		::AdjustTokenPrivileges(hToken_, false, &tpPrevious, cbPrevious, NULL, NULL);
+		if (::GetLastError() != ERROR_SUCCESS)
+			return false;
+		return true;
+	}
+private:
+	HANDLE hToken_;
+	tstring privilege_;
+};
+
+static void killProcess(DWORD PID)
+{
+	CPrivilege privilege(SE_DEBUG_NAME);	// Adjust privileges
+
+	HANDLE hProcess = ::OpenProcess(PROCESS_TERMINATE, FALSE, PID);
+	if (hProcess)
+	{
+		if (::TerminateProcess(hProcess, -1))
+			printf(_T("PID %u was terminated."), PID);
+		::CloseHandle(hProcess);
+	}
 }
 
 int _tmain(int argc, _TCHAR* argv[])
 {
-	_tprintf(_T("CompatKiller")
-#ifdef _WIN64
-		_T( " x64")
-#endif
-		_T(". (C) 2024 VorontSOFT. Version 1.0\n"));
+	_tprintf(_T("CompatKiller. (C) 2024 VorontSOFT. Version 1.0\nWatching "));
 
 	while (true)
 	{
-		if (isProcessRunning(_T("CompatTelRunner.exe")))
-			printf("Found\n");
+		auto PID = isProcessRunning(_T("cmd.exe"));
+		if (PID != 0)
+		{
+			printf("\nFound PID %u, terminating...\n", PID);
+			killProcess(PID);
+			printf("\nWatching ");
+		}
+		printf(".");
 		_sleep(2000);
 	}
-	
-	return help();
+
+	return 0;
 }
